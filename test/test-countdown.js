@@ -943,3 +943,18 @@ test('#2000: eine abgesagte Instanz ist auch ueber die Zeitumstellung kein naech
   const google = { ...ev, start_datetime: '2035-10-01T19:30:00-04:00' };
   assert.equal(nextEventDate(google, '2035-11-10', new Set(['2035-11-13']), { tz }), '2035-11-19');
 });
+
+test('#2000: Haushalt in UTC, Serie in Berlin - der Schluessel kommt aus dem Vorkommen, nicht aus der Wanduhr des Masters', () => {
+  // Taeglich 01:30 Berlin ab Winter: 00:30Z. Nach dem 25. Maerz 2035 ist
+  // 01:30 MESZ 23:30Z am Vortag - das Vorkommen vom 27. (Berlin) beginnt am
+  // 26. (UTC) und traegt den Schluessel `2035-03-26` (Codex-Review zu #2031).
+  const ev = {
+    start_datetime: '2035-03-01T00:30:00Z', all_day: 0,
+    recurrence_rule: 'FREQ=DAILY', tzid: 'Europe/Berlin',
+  };
+  const tz = 'UTC';
+  assert.equal(nextEventDate(ev, '2035-03-26', new Set(['2035-03-26']), { tz }), '2035-03-27',
+    'das abgesagte Vorkommen (Berlin 27., UTC 26.) darf nicht der naechste Termin sein');
+  assert.equal(nextEventDate(ev, '2035-03-26', new Set(['2035-03-25']), { tz }), '2035-03-26',
+    'eine Ausnahme fuer den Vortag laesst den 26. stehen');
+});

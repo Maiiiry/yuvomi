@@ -346,7 +346,7 @@
     "test:caldav-recurrence": "node test/test-caldav-recurrence.js",
     "test:caldav-until-time": "TZ=UTC node --experimental-sqlite --test test/test-caldav-until-time.js && TZ=America/Denver node --experimental-sqlite --test test/test-caldav-until-time.js",
     "test:google-multi": "node --experimental-sqlite test/test-google-multi.js",
-    "test:google-outbound": "node --experimental-sqlite --test test/test-google-outbound.js",
+    "test:google-outbound": "TZ=UTC node --experimental-sqlite --test test/test-google-outbound.js && TZ=America/Chicago node --experimental-sqlite --test test/test-google-outbound.js",
     "test:calendar-outbound-migration": "node --test test/test-calendar-outbound-migration.js",
     "test:caldav-outbound": "node --experimental-sqlite --test test/test-caldav-outbound.js",
     "test:caldav-todo-outbound": "TZ=Europe/Berlin node --experimental-sqlite --test test/test-caldav-todo-outbound.js",

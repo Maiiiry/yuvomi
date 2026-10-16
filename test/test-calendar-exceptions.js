@@ -282,7 +282,7 @@ test('#2000: GET /calendar zeigt das abgesagte Vorkommen nicht', async () => {
   } finally { await close(); }
 });
 
-test('#2000: Migration 250 schreibt lokale Schluessel auf den UTC-Tag um, UTC-Schluessel bleiben', () => {
+test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abgerufen, CalDAV unberuehrt', () => {
   seedUser();
   setHouseholdZone('America/New_York');
   const migration = MIGRATIONS.find((m) => m.version === 250);
@@ -290,25 +290,43 @@ test('#2000: Migration 250 schreibt lokale Schluessel auf den UTC-Tag um, UTC-Sc
   const exceptions = (id) => db.get().prepare(
     'SELECT exception_date FROM calendar_event_exceptions WHERE event_id = ? ORDER BY exception_date'
   ).all(id).map((r) => r.exception_date);
+  db.get().prepare(`INSERT INTO google_calendar_selection (calendar_id, name, enabled, sync_token, last_sync)
+    VALUES ('g2000', 'G', 1, 'tok-2000', '2035-11-01T00:00:00Z')
+    ON CONFLICT(calendar_id) DO UPDATE SET sync_token = excluded.sync_token, last_sync = excluded.last_sync`).run();
 
-  // Google: der Abruf hatte den lokalen Tag abgelegt.
+  // Google: welche Form ein Schluessel hatte, steht nirgends. `2035-11-12`
+  // kam aus `originalStartTime` mit Offset (lokal), `2035-11-13` aus
+  // `EXDATE:20351113T003000Z` (schon UTC). Eine Umrechnung muesste raten und
+  // verschoebe den zweiten auf den 14. (Codex-Review zu #2031).
   const google = db.get().prepare(
     `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, tzid, external_source, external_calendar_id, created_by)
-     VALUES ('G', '2035-10-01T19:30:00-04:00', '2035-10-01T20:30:00-04:00', 0, 'FREQ=DAILY', 'America/New_York', 'google', 'g1', 1)`
+     VALUES ('G', '2035-10-01T19:30:00-04:00', '2035-10-01T20:30:00-04:00', 0, 'FREQ=WEEKLY', 'America/New_York', 'google', 'g1', 1)`
   ).run().lastInsertRowid;
-  addException(google, '2035-10-15'); // EDT: derselbe UTC-Tag
-  addException(google, '2035-11-12'); // EST: der 13.
-  addException(google, '2035-11-13'); // EST: der 14. - taeglich, die beiden verdraengen sich
+  addException(google, '2035-11-12');
+  addException(google, '2035-11-13');
+  // Eine ganztaegige Google-Serie hat nur Tage als Schluessel - sie bleibt.
+  const googleAllDay = db.get().prepare(
+    `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, external_source, external_calendar_id, created_by)
+     VALUES ('GT', '2035-10-01', '2035-10-01', 1, 'FREQ=WEEKLY', 'google', 'g2', 1)`
+  ).run().lastInsertRowid;
+  addException(googleAllDay, '2035-11-12');
 
-  // Hier gefuehrt, zonenlose Ziffern neben der tzid (#1993); die Kennung war lokal.
+  // Hier gefuehrt, zonenlose Ziffern neben der tzid (#1993); die Kennung kam
+  // nur aus der Oberflaeche und war sicher lokal.
   const local = db.get().prepare(
     `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, tzid, created_by)
-     VALUES ('L', '2035-10-01T19:30', '2035-10-01T20:30', 0, 'FREQ=WEEKLY', 'America/New_York', 1)`
+     VALUES ('L', '2035-10-01T19:30', '2035-10-01T20:30', 0, 'FREQ=DAILY', 'America/New_York', 1)`
   ).run().lastInsertRowid;
-  addException(local, '2035-11-12');
+  addException(local, '2035-10-15'); // EDT: derselbe UTC-Tag
+  addException(local, '2035-11-12'); // EST: der 13.
+  addException(local, '2035-11-13'); // EST: der 14. - taeglich, die beiden verdraengen sich
   const child = db.get().prepare(
     `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_parent_id, recurrence_id, created_by)
      VALUES ('L*', '2035-11-19T21:00', '2035-11-19T22:00', 0, ?, '2035-11-19', 1)`
+  ).run(local).lastInsertRowid;
+  const nextChild = db.get().prepare(
+    `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_parent_id, recurrence_id, created_by)
+     VALUES ('L**', '2035-11-20T21:00', '2035-11-20T22:00', 0, ?, '2035-11-20', 1)`
   ).run(local).lastInsertRowid;
 
   // CalDAV: schon immer der UTC-Tag - bleibt.
@@ -317,14 +335,22 @@ test('#2000: Migration 250 schreibt lokale Schluessel auf den UTC-Tag um, UTC-Sc
 
   migration.up(db.get());
 
-  assert.deepEqual(exceptions(google), ['2035-10-15', '2035-11-13', '2035-11-14']);
-  assert.deepEqual(exceptions(local), ['2035-11-13']);
-  assert.equal(db.get().prepare('SELECT recurrence_id FROM calendar_events WHERE id = ?').get(child).recurrence_id, '2035-11-20');
+  assert.deepEqual(exceptions(google), [], 'Google: kein geratener Schluessel bleibt stehen');
+  assert.deepEqual(
+    db.get().prepare("SELECT sync_token, last_sync FROM google_calendar_selection WHERE calendar_id = 'g2000'").get(),
+    { sync_token: null, last_sync: null },
+    'Google: der naechste Lauf ist ein Full-Resync, der die Ausnahmen neu schreibt',
+  );
+  assert.deepEqual(exceptions(googleAllDay), ['2035-11-12']);
+  assert.deepEqual(exceptions(local), ['2035-10-15', '2035-11-13', '2035-11-14']);
+  const childKey = (id) => db.get().prepare('SELECT recurrence_id FROM calendar_events WHERE id = ?').get(id).recurrence_id;
+  assert.equal(childKey(child), '2035-11-20');
+  assert.equal(childKey(nextChild), '2035-11-21');
   assert.deepEqual(exceptions(caldav), ['2035-11-13']);
 
   // Und die Expansion trifft danach das gemeinte Vorkommen.
-  const googleStarts = startsOf(google, '2035-11-10', '2035-11-16');
-  assert.ok(!googleStarts.includes('2035-11-13T00:30:00Z'), 'Google: der 12. November bleibt abgesagt');
-  assert.ok(!googleStarts.includes('2035-11-14T00:30:00Z'), 'Google: der 13. November bleibt abgesagt');
-  assert.ok(googleStarts.includes('2035-11-12T00:30:00Z'), 'Google: der 11. November bleibt stehen');
+  const localStarts = startsOf(local, '2035-11-10', '2035-11-16');
+  assert.ok(!localStarts.includes('2035-11-13T00:30:00Z'), 'der 12. November bleibt abgesagt');
+  assert.ok(!localStarts.includes('2035-11-14T00:30:00Z'), 'der 13. November bleibt abgesagt');
+  assert.ok(localStarts.includes('2035-11-12T00:30:00Z'), 'der 11. November bleibt stehen');
 });

@@ -25,7 +25,7 @@ import { decodeHtmlEntities } from '../utils/html-entities.js';
 import { nearestColorId } from '../utils/ical-color.js';
 // Fallback-Zone für den Outbound-Sync, wenn Google für den Zielkalender keine liefert.
 import {
-  configuredHouseholdTimeZone, householdTimeZone, isValidTimeZone, localToUTCPrecise,
+  configuredHouseholdTimeZone, hasExplicitZone, householdTimeZone, isValidTimeZone, localToUTCPrecise,
 } from '../utils/timezone.js';
 import { localDayEndUtc, utcStamp } from '../utils/rrule-until.js';
 import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
@@ -919,9 +919,9 @@ function exdatesOf(item) {
   return dates;
 }
 
-/** Der UTC-Tag eines Zeitpunkts mit Zone, sonst null. */
+/** Der UTC-Tag eines Zeitpunkts mit Zone, sonst null - zonenlose Ziffern nie. */
 function utcDayOf(instant) {
-  if (!instant) return null;
+  if (!instant || !hasExplicitZone(instant)) return null;
   const ms = Date.parse(instant);
   return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null;
 }
@@ -935,11 +935,27 @@ function utcDayOf(instant) {
  * Offset der Serienzone, `2035-11-12T19:30:00-05:00`, und dessen erste zehn
  * Zeichen sind der LOKALE Tag. Die Expansion fuehrt ein Vorkommen unter seinem
  * UTC-Tag, wie die Importe aus ICS, CalDAV und Apple.
+ *
+ * Ohne Offset gilt die mitgelieferte `timeZone` (Google erlaubt das, wenn die
+ * Zone daneben steht), ersatzweise die des Serienstarts oder des Kalenders -
+ * nie die Zone des Server-Prozesses.
  */
-function originalStartDate(item) {
-  const dateTime = item.originalStartTime?.dateTime;
-  if (dateTime) return utcDayOf(dateTime) ?? String(dateTime).slice(0, 10);
-  const date = item.originalStartTime?.date;
+function originalStartDate(item, calTimeZone = null) {
+  const original = item.originalStartTime ?? {};
+  const dateTime = original.dateTime;
+  if (dateTime) {
+    const raw = String(dateTime);
+    if (hasExplicitZone(raw)) return utcDayOf(raw) ?? raw.slice(0, 10);
+    const zone = [original.timeZone, item.start?.timeZone, calTimeZone]
+      .find((candidate) => candidate && isValidTimeZone(candidate));
+    const wall = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?/.exec(raw)?.[0];
+    if (zone && wall) {
+      const day = utcDayOf(localToUTCPrecise(wall.length === 16 ? `${wall}:00` : wall, zone));
+      if (day) return day;
+    }
+    return raw.slice(0, 10);
+  }
+  const date = original.date;
   return date ? String(date).slice(0, 10) : null;
 }
 
@@ -999,7 +1015,7 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
       // genau dieses Datum aus ihr ausnehmen.
       if (item.recurringEventId) {
         const master = findLocal.get(item.recurringEventId);
-        const date   = originalStartDate(item);
+        const date   = originalStartDate(item, calTimeZone);
         if (master && date) insException.run(master.id, date);
       }
       del.run(item.id, calRefId, calRefId);
@@ -1017,7 +1033,7 @@ function upsertGoogleEvents(items, calRefId = null, calColor = GOOGLE_COLOR, col
     // Verfahren wie bei CalDAV/ICS (normalizeRecurrenceOverrides).
     if (item.recurringEventId) {
       const master = findLocal.get(item.recurringEventId);
-      const date   = originalStartDate(item);
+      const date   = originalStartDate(item, calTimeZone);
       if (master && date) insException.run(master.id, date);
     }
 

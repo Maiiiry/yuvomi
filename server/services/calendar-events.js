@@ -418,3 +418,42 @@ export function expandRecurringEvents(
 
   return result.sort((a, b) => a.start_datetime.localeCompare(b.start_datetime));
 }
+
+/**
+ * Der Schluessel (EXDATE, `recurrence_identity`) des Vorkommens einer Serie,
+ * das in der Zone `zone` am Tag `dayKey` beginnt - oder null, wenn dort keines
+ * beginnt (#2000).
+ *
+ * Fuer Leser, die auf Kalendertagen statt auf Vorkommen rechnen (die
+ * Countdown-Kachel). Sie fragen die Expansion selbst, statt den Schluessel aus
+ * der Wanduhr des Masters nachzubauen: ueber eine Zeitumstellung, und wenn
+ * Haushalts- und Serienzone verschieden sind, trifft nur der tatsaechliche
+ * Zeitpunkt des Vorkommens den Schluessel, unter dem die Expansion es fuehrt.
+ *
+ * @param {object} event   Serienzeile (recurrence_rule, start_datetime, tzid, ...)
+ * @param {string} dayKey  YYYY-MM-DD in `zone`
+ * @param {string} zone    IANA-Zone, in der `dayKey` gemeint ist
+ * @param {{householdZone?: string}} [options]  wie bei expandRecurringEvents
+ * @returns {string|null}
+ */
+export function occurrenceKeyOnDay(event, dayKey, zone, { householdZone = null } = {}) {
+  if (!event?.recurrence_rule || !/^\d{4}-\d{2}-\d{2}$/.test(String(dayKey))) return null;
+  const shift = (key, days) => {
+    const d = new Date(`${key}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+  };
+  const dayOf = (start) => {
+    const raw = String(start ?? '');
+    if (raw.length <= 10 || !hasExplicitZone(raw)) return raw.slice(0, 10);
+    return utcToWall(raw, zone)?.date ?? raw.slice(0, 10);
+  };
+  // Ein Tag Luft auf beiden Seiten: Fenster und Schleife fuehren UTC- bzw.
+  // Serientage, der gefragte Tag liegt in `zone` (dieselbe Begruendung wie in
+  // `baseOccurrenceFor`).
+  const occurrences = expandRecurringEvents([event], shift(dayKey, -1), shift(dayKey, 1), null, {
+    includeRecurrenceIdentity: true, maxIterations: MAX_EXPANSION_ITERATIONS, householdZone,
+  });
+  return occurrences.find((occurrence) => dayOf(occurrence.start_datetime) === dayKey)
+    ?.recurrence_identity ?? null;
+}

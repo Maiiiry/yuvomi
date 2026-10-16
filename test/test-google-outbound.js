@@ -984,6 +984,107 @@ test('#2000: Absage und EXDATE einer Abendserie landen auf dem UTC-Tag des Vorko
     'der Schluessel, den ICS, CalDAV und Apple ablegen und die Expansion nachschlaegt');
 });
 
+test('#2000: originalStartTime ohne Offset wird in seiner timeZone gelesen, nicht in der Prozesszone', () => {
+  reset();
+  const calRefId = __test.upsertExternalCalendar('google', 'primary', 'Primär', '#4285F4');
+
+  // Google erlaubt `dateTime` ohne Offset, wenn `timeZone` daneben steht.
+  // Tokio 08:00 am 13.11. ist 23:00Z am 12.; New York 19:30 am 12.11. ist
+  // 00:30Z am 13. In der Prozesszone gelesen (UTC wie Chicago) kaemen beide
+  // auf den falschen Tag.
+  __test.upsertGoogleEvents([
+    seriesMaster('tokio', {
+      start: { dateTime: '2035-10-02T08:00:00+09:00', timeZone: 'Asia/Tokyo' },
+      end:   { dateTime: '2035-10-02T09:00:00+09:00', timeZone: 'Asia/Tokyo' },
+    }),
+    occurrence('tokio', '20351112T230000Z', {
+      status: 'cancelled',
+      originalStartTime: { dateTime: '2035-11-13T08:00:00', timeZone: 'Asia/Tokyo' },
+    }),
+    seriesMaster('chor', {
+      start: { dateTime: '2035-10-01T19:30:00-04:00', timeZone: 'America/New_York' },
+      end:   { dateTime: '2035-10-01T20:30:00-04:00', timeZone: 'America/New_York' },
+    }),
+    occurrence('chor', '20351113T003000Z', {
+      status: 'cancelled',
+      originalStartTime: { dateTime: '2035-11-12T19:30:00', timeZone: 'America/New_York' },
+    }),
+  ], calRefId);
+
+  const rows = googleRows();
+  assert.deepEqual(exceptionDates(rows.find((r) => r.external_calendar_id === 'tokio').id), ['2035-11-12']);
+  assert.deepEqual(exceptionDates(rows.find((r) => r.external_calendar_id === 'chor').id), ['2035-11-13']);
+});
+
+test('#2000: nach Migration 250 schreibt der Full-Resync jede Ausnahme einer Google-Serie neu', async () => {
+  reset();
+  setHouseholdZone('America/New_York');
+  __test.setCalendarEnabled('family2000', true, { name: 'Family' });
+  const calRefId = __test.upsertExternalCalendar('google', 'family2000', 'Family', '#4285F4');
+  const master = {
+    ...seriesMaster('chor2000', {
+      recurrence: ['RRULE:FREQ=WEEKLY', 'EXDATE;TZID=America/New_York:20351119T193000'],
+      start: { dateTime: '2035-10-01T19:30:00-04:00', timeZone: 'America/New_York' },
+      end:   { dateTime: '2035-10-01T20:30:00-04:00', timeZone: 'America/New_York' },
+    }),
+  };
+  const cancelled = occurrence('chor2000', '20351113T003000Z', {
+    status: 'cancelled',
+    originalStartTime: { dateTime: '2035-11-12T19:30:00-05:00', timeZone: 'America/New_York' },
+  });
+  const moved = occurrence('chor2000', '20351127T003000Z', {
+    originalStartTime: { dateTime: '2035-11-26T19:30:00-05:00', timeZone: 'America/New_York' },
+    start: { dateTime: '2035-11-27T20:00:00-05:00' },
+    end:   { dateTime: '2035-11-27T21:00:00-05:00' },
+  });
+  __test.upsertGoogleEvents([master], calRefId);
+  const row = googleRows().find((r) => r.external_calendar_id === 'chor2000');
+  // Der Stand vor dem Fix: der Abruf hatte lokale Tage abgelegt.
+  db.prepare('DELETE FROM calendar_event_exceptions WHERE event_id = ?').run(row.id);
+  for (const day of ['2035-11-12', '2035-11-19', '2035-11-26']) {
+    db.prepare('INSERT INTO calendar_event_exceptions (event_id, exception_date) VALUES (?, ?)').run(row.id, day);
+  }
+  __test.recordSyncToken('family2000', 'token-vor-2000');
+
+  dbmod.MIGRATIONS.find((m) => m.version === 250).up(db);
+  assert.deepEqual(exceptionDates(row.id), [], 'die geratenen Schluessel sind weg');
+  assert.equal(__test.getSyncToken('family2000'), null, 'der naechste Lauf ist ein Full-Resync');
+
+  const listed = [];
+  const calendar = {
+    calendarList: {
+      get: async ({ calendarId }) => ({
+        data: { accessRole: 'owner', timeZone: 'America/New_York', summary: calendarId, backgroundColor: '#4285F4' },
+      }),
+    },
+    colors: { get: async () => ({ data: { event: {} } }) },
+    events: {
+      list: async (params) => {
+        listed.push(params);
+        // Google haelt abgesagte und verschobene Instanzen fuer die Lebensdauer
+        // der Serie vor und liefert sie mit showDeleted auch ohne syncToken.
+        const items = params.calendarId === 'family2000' && !params.syncToken && params.showDeleted
+          ? [master, cancelled, moved] : [];
+        return { data: { items, nextSyncToken: 'token-nach-2000' } };
+      },
+      insert: async () => ({ data: { id: 'unused' } }),
+      patch: async () => ({ data: {} }),
+      delete: async () => ({}),
+    },
+  };
+  try {
+    await sync({ createCalendar: () => calendar });
+  } finally {
+    setHouseholdZone(null);
+  }
+
+  const family = listed.filter((p) => p.calendarId === 'family2000');
+  assert.ok(family.length > 0 && !family[0].syncToken, 'ohne Token abgerufen');
+  assert.deepEqual(exceptionDates(row.id), ['2035-11-13', '2035-11-20', '2035-11-27'],
+    'abgesagt, per EXDATE ausgenommen und verschoben - alle auf dem UTC-Tag');
+  assert.equal(__test.getSyncToken('family2000'), 'token-nach-2000');
+});
+
 test('die Reihenfolge in Googles Antwort spielt keine Rolle', () => {
   reset();
   const calRefId = __test.upsertExternalCalendar('google', 'primary', 'Primär', '#4285F4');

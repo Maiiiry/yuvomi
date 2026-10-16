@@ -39,13 +39,11 @@
 import { localCalendarColorSql, localCalendarIdSql } from './local-calendars.js';
 
 import { hasAnyOccurrence, nextOccurrenceAfter, seriesStartFor } from './recurrence.js';
-import { loadEventExceptions } from './calendar-events.js';
+import { loadEventExceptions, occurrenceKeyOnDay } from './calendar-events.js';
 import { modulesLeftOut, notBirthdayEventSql } from './household-modules.js';
 import { eventProjectionSql, resolveProjectedEventRows } from './calendar-event-reader.js';
 import { icsSubscriptionVisibleWhere, visibilityWhere } from './visibility.js';
-import {
-  hasExplicitZone, householdTimeZone, localToUTC, storedToInstantIso, utcToWall,
-} from '../utils/timezone.js';
+import { householdTimeZone, utcToWall } from '../utils/timezone.js';
 // Dieselbe Rangfolge wie im Kalender und auf der Uebersicht - eine Regel, eine
 // Datei. Der Server importiert oefter aus `public/utils/` (date, folder-tree,
 // currency-codes, ...), immer fuer abhaengigkeitsfreie geteilte Regeln.
@@ -127,37 +125,14 @@ function eventStartDateKey(event, tz) {
  * `dayKey` fuehrt (#2000).
  *
  * Die Kachel rechnet auf Tagen der Haushaltszone, die Ausnahmen tragen den
- * UTC-Tag des Vorkommens - wie die Expansion in calendar-events.js sie
- * nachschlaegt. Bei New York 19:30 ist das im Winter der Folgetag; ohne diese
- * Umrechnung nannte die Kachel ein abgesagtes Vorkommen als naechsten Termin.
- *
- * - ganztaegig, oder zonenlose Ziffern ohne Serienzone: der Tag selbst.
- * - mit Serienzone: die Wanduhr der Serie an dem Tag, an dem der Haushaltstag
- *   in der Serienzone liegt, als Zeitpunkt - dieselbe Rechnung wie
- *   `instantFuer()` der Expansion.
- * - ein Zeitpunkt ohne Serienzone: die Expansion wiederholt seinen UTC-Teil,
- *   also liegt jedes Vorkommen um denselben Tagesversatz vom Haushaltstag
- *   entfernt wie der Start.
+ * UTC-Tag des Vorkommens. Den kennt nur die Expansion sicher - ueber eine
+ * Zeitumstellung und bei verschiedener Haushalts- und Serienzone liegt er
+ * nicht dort, wo die Wanduhr des Masters ihn vermuten liesse. Deshalb fragt
+ * die Kachel dieselbe Funktion wie der Kalender (`occurrenceKeyOnDay`);
+ * beginnt an dem Tag kein Vorkommen, bleibt es beim Tag selbst.
  */
 function exceptionKeyFor(event, dayKey, tz) {
-  const raw = String(event.start_datetime ?? '');
-  if (event.all_day || raw.length <= 10) return dayKey;
-  if (event.tzid) {
-    let start;
-    try { start = storedToInstantIso(raw, tz); } catch { return dayKey; }
-    const householdWall = start ? utcToWall(start, tz) : null;
-    const seriesWall = start ? utcToWall(start, event.tzid) : null;
-    if (!householdWall || !seriesWall) return dayKey;
-    const seriesDay = utcToWall(localToUTC(`${dayKey}T${householdWall.time}`, tz), event.tzid)?.date;
-    const instant = seriesDay ? localToUTC(`${seriesDay}T${seriesWall.time}`, event.tzid) : null;
-    return /^\d{4}-\d{2}-\d{2}/.test(String(instant)) ? String(instant).slice(0, 10) : dayKey;
-  }
-  if (!hasExplicitZone(raw)) return dayKey;
-  const startDay = eventStartDateKey(event, tz);
-  const ms = Date.parse(raw);
-  if (!startDay || !Number.isFinite(ms)) return dayKey;
-  const offset = daysBetween(startDay, new Date(ms).toISOString().slice(0, 10));
-  return offset ? shiftKey(dayKey, offset) ?? dayKey : dayKey;
+  return occurrenceKeyOnDay(event, dayKey, tz, { householdZone: tz }) ?? dayKey;
 }
 
 /**
