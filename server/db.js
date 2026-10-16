@@ -32,6 +32,7 @@ import {
   householdTimeZone, isValidTimeZone, localToUTC, storedToInstantIso, todayKey, utcToWall,
 } from './utils/timezone.js';
 import { addMonthsClamped, liftToAnchorDay } from './utils/interval-date.js';
+import { googleFullSyncTimeMax } from './utils/google-sync-window.js';
 
 const log = createLogger('DB');
 
@@ -10935,13 +10936,14 @@ const MIGRATIONS = [
     // Google-Serien weg und die Sync-Tokens mit ihnen: der naechste Lauf ist ein
     // Full-Resync, und der liefert jede abgesagte und verschobene Instanz einer
     // Serie wieder (`showDeleted`, Google haelt sie fuer die Lebensdauer der
-    // Serie vor). Ausnahmen einer Google-Serie entstehen nur dort - die
+    // Serie vor) - aber nur bis zu seinem `timeMax`. Was dahinter liegt, bleibt
+    // stehen (utils/google-sync-window.js). Ausnahmen einer Google-Serie entstehen nur dort - die
     // Oberflaeche nimmt fuer fremde Serien keine an.
     //
     // ICS, CalDAV und Apple schrieben schon immer den UTC-Tag; ihre Zeilen
     // bleiben unberuehrt. Rechnung und Auswahl in rekeyZonedOccurrenceDays().
-    up(database) {
-      rekeyZonedOccurrenceDays(database);
+    up(database, { now = Date.now() } = {}) {
+      rekeyZonedOccurrenceDays(database, { now });
     },
   },
 ];
@@ -10950,9 +10952,10 @@ const MIGRATIONS = [
  * Der Nachtrag zu Migration 250 (#2000): Schluessel, die den lokalen Tag eines
  * Vorkommens nennen, auf dessen UTC-Tag bringen.
  *
- * Google-Serien (getimt): Ausnahmen loeschen und die Sync-Tokens verwerfen,
- * der naechste Full-Resync schreibt sie in der neuen Form (Begruendung an
- * Migration 250).
+ * Google-Serien (getimt): Ausnahmen loeschen, die der naechste Full-Resync
+ * wieder liefert (vor seinem `timeMax`), und die Sync-Tokens verwerfen; der
+ * Abruf schreibt sie in der neuen Form (Begruendung an Migration 250).
+ * `now` ist der Zeitpunkt, von dem aus das Fenster gerechnet wird.
  *
  * Hier gefuehrte Serien mit `tzid`, deren erstes Vorkommen lokal und in UTC
  * auf denselben Tag faellt - nur dort lief die alte Expansion auf dem lokalen
@@ -10962,21 +10965,34 @@ const MIGRATIONS = [
  * verdraengen (K -> K+1, K+1 -> K+2): erst alle alten weg, dann alle neuen
  * hinein. Die Aufrufer sorgen fuer die Transaktion.
  */
-function rekeyZonedOccurrenceDays(database) {
+function rekeyZonedOccurrenceDays(database, { now = Date.now() } = {}) {
   const hasColumn = (table, column) => database.prepare(`PRAGMA table_info(${table})`).all()
     .some((c) => c.name === column);
   if (!hasColumn('calendar_events', 'tzid')) return;
   const withChildren = hasColumn('calendar_events', 'recurrence_parent_id')
     && hasColumn('calendar_events', 'recurrence_id');
+  // NUR WAS DER FULL-RESYNC WIEDER LIEFERT (Codex-Review zu #2031). Sein
+  // `timeMax` liegt ein Jahr nach dem Abruf, eine Untergrenze hat er nicht.
+  // Eine Absage dahinter kaeme nie zurueck - ein Schluessel, der vielleicht
+  // einen Tag daneben liegt, ist besser als eine verlorene Absage. Zwei Tage
+  // Abstand zur Grenze: einer fuer die Zone des Schluessels, einer fuer den
+  // Weg von der Migration bis zum Abruf.
+  const keepFrom = (() => {
+    const max = new Date(googleFullSyncTimeMax(now));
+    max.setUTCDate(max.getUTCDate() - 2);
+    return max.toISOString().slice(0, 10);
+  })();
   const googleSeries = database.prepare(`
     SELECT id FROM calendar_events
     WHERE external_source = 'google' AND all_day = 0
       AND recurrence_rule IS NOT NULL AND recurrence_rule <> ''
-      AND id IN (SELECT event_id FROM calendar_event_exceptions)
-  `).all();
+      AND id IN (SELECT event_id FROM calendar_event_exceptions WHERE exception_date < ?)
+  `).all(keepFrom);
   if (googleSeries.length > 0) {
-    const dropAll = database.prepare('DELETE FROM calendar_event_exceptions WHERE event_id = ?');
-    for (const { id } of googleSeries) dropAll.run(id);
+    const dropCovered = database.prepare(
+      'DELETE FROM calendar_event_exceptions WHERE event_id = ? AND exception_date < ?'
+    );
+    for (const { id } of googleSeries) dropCovered.run(id, keepFrom);
     const hasSelection = database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'google_calendar_selection'"
     ).get();

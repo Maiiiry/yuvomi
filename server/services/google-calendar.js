@@ -28,6 +28,7 @@ import {
   configuredHouseholdTimeZone, hasExplicitZone, householdTimeZone, isValidTimeZone, localToUTCPrecise,
 } from '../utils/timezone.js';
 import { localDayEndUtc, utcStamp } from '../utils/rrule-until.js';
+import { googleFullSyncTimeMax } from '../utils/google-sync-window.js';
 import { authoredAfterInbound, outboundEvent } from './outbound-dtstart.js';
 import { alignmentMoved, googleReading, isEcho, sentSnapshot } from './outbound-echo.js';
 import { assignDefaultToEvent, reassignDefaultOnCalendarMove } from './sync-assignment.js';
@@ -712,7 +713,7 @@ async function runSync(createCalendar) {
         // geprüft, nicht gegen die Vorkommen. Eine 2019 begonnene, bis heute
         // laufende Wochenserie fiele damit aus dem Abruf. Das kostet nichts an
         // Volumen - ein Master ersetzt alle seine Instanzen.
-        listParams.timeMax = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+        listParams.timeMax = googleFullSyncTimeMax(Date.now());
       }
 
       let response;

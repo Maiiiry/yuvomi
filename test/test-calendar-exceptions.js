@@ -304,6 +304,9 @@ test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abger
   ).run().lastInsertRowid;
   addException(google, '2035-11-12');
   addException(google, '2035-11-13');
+  // Hinter dem Fenster des Full-Resyncs (`timeMax` = Abruf + 365 Tage): der
+  // Abruf liefert diese Absage nicht wieder, also bleibt ihr Schluessel.
+  addException(google, '2036-11-05'); // 400 Tage nach dem 01.10.2035
   // Eine ganztaegige Google-Serie hat nur Tage als Schluessel - sie bleibt.
   const googleAllDay = db.get().prepare(
     `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, external_source, external_calendar_id, created_by)
@@ -333,9 +336,11 @@ test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abger
   const caldav = seedNewYorkEvening();
   addException(caldav, '2035-11-13');
 
-  migration.up(db.get());
+  // Die Migration laeuft am 01.10.2035 - feste Uhr statt der echten.
+  migration.up(db.get(), { now: Date.UTC(2035, 9, 1, 12) });
 
-  assert.deepEqual(exceptions(google), [], 'Google: kein geratener Schluessel bleibt stehen');
+  assert.deepEqual(exceptions(google), ['2036-11-05'],
+    'Google: geratene Schluessel im Fenster weg, die Absage dahinter bleibt');
   assert.deepEqual(
     db.get().prepare("SELECT sync_token, last_sync FROM google_calendar_selection WHERE calendar_id = 'g2000'").get(),
     { sync_token: null, last_sync: null },
@@ -353,4 +358,37 @@ test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abger
   assert.ok(!localStarts.includes('2035-11-13T00:30:00Z'), 'der 12. November bleibt abgesagt');
   assert.ok(!localStarts.includes('2035-11-14T00:30:00Z'), 'der 13. November bleibt abgesagt');
   assert.ok(localStarts.includes('2035-11-12T00:30:00Z'), 'der 11. November bleibt stehen');
+});
+
+const { occurrenceKeyOnDay } = await import('../server/services/calendar-events.js');
+const { utcToWall } = await import('../server/utils/timezone.js');
+
+test('#2000: occurrenceKeyOnDay liefert denselben Schluessel wie die Expansion, ueber beide Umstellungen', () => {
+  const series = [
+    { id: 1, start_datetime: '2035-10-01T23:30:00Z', all_day: 0, recurrence_rule: 'FREQ=DAILY', tzid: 'America/New_York' },
+    { id: 2, start_datetime: '2035-10-01T19:30:00-04:00', all_day: 0, recurrence_rule: 'FREQ=WEEKLY', tzid: 'America/New_York' },
+    { id: 3, start_datetime: '2035-03-01T00:30:00Z', all_day: 0, recurrence_rule: 'FREQ=DAILY', tzid: 'Europe/Berlin' },
+    { id: 4, start_datetime: '2035-10-01T23:30:00Z', all_day: 0, recurrence_rule: 'FREQ=DAILY', tzid: null },
+  ];
+  const windows = {
+    1: ['2035-10-25', '2035-11-15'], 2: ['2035-10-25', '2035-11-30'],
+    3: ['2035-03-15', '2035-04-05'], 4: ['2035-10-25', '2035-11-15'],
+  };
+  let checked = 0;
+  for (const event of series) {
+    const [from, to] = windows[event.id];
+    const occurrences = expandRecurringEvents([event], from, to, null, { includeRecurrenceIdentity: true });
+    for (const zone of [event.tzid ?? 'UTC', 'UTC', 'America/Chicago']) {
+      const days = occurrences.map((o) => utcToWall(o.start_datetime, zone).date);
+      occurrences.forEach((occurrence, i) => {
+        // Zwei Vorkommen am selben Tag (Fruehjahrsnacht) haben keinen
+        // eindeutigen Tag - die bleiben der Folgeaufgabe #2034.
+        if (days.indexOf(days[i]) !== days.lastIndexOf(days[i])) return;
+        assert.equal(occurrenceKeyOnDay(event, days[i], zone), occurrence.recurrence_identity,
+          `Serie ${event.id}, ${occurrence.start_datetime} in ${zone}`);
+        checked++;
+      });
+    }
+  }
+  assert.ok(checked > 100, `zu wenig geprueft: ${checked}`);
 });

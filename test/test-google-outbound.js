@@ -1041,13 +1041,15 @@ test('#2000: nach Migration 250 schreibt der Full-Resync jede Ausnahme einer Goo
   const row = googleRows().find((r) => r.external_calendar_id === 'chor2000');
   // Der Stand vor dem Fix: der Abruf hatte lokale Tage abgelegt.
   db.prepare('DELETE FROM calendar_event_exceptions WHERE event_id = ?').run(row.id);
-  for (const day of ['2035-11-12', '2035-11-19', '2035-11-26']) {
+  for (const day of ['2035-11-12', '2035-11-19', '2035-11-26', '2036-11-04']) {
     db.prepare('INSERT INTO calendar_event_exceptions (event_id, exception_date) VALUES (?, ?)').run(row.id, day);
   }
   __test.recordSyncToken('family2000', 'token-vor-2000');
 
-  dbmod.MIGRATIONS.find((m) => m.version === 250).up(db);
-  assert.deepEqual(exceptionDates(row.id), [], 'die geratenen Schluessel sind weg');
+  // Feste Uhr: die Migration laeuft am 01.10.2035. `2036-11-04` liegt hinter
+  // dem Fenster des Full-Resyncs und kaeme nie wieder - er bleibt.
+  dbmod.MIGRATIONS.find((m) => m.version === 250).up(db, { now: Date.UTC(2035, 9, 1, 12) });
+  assert.deepEqual(exceptionDates(row.id), ['2036-11-04'], 'die geratenen Schluessel im Fenster sind weg');
   assert.equal(__test.getSyncToken('family2000'), null, 'der naechste Lauf ist ein Full-Resync');
 
   const listed = [];
@@ -1080,8 +1082,8 @@ test('#2000: nach Migration 250 schreibt der Full-Resync jede Ausnahme einer Goo
 
   const family = listed.filter((p) => p.calendarId === 'family2000');
   assert.ok(family.length > 0 && !family[0].syncToken, 'ohne Token abgerufen');
-  assert.deepEqual(exceptionDates(row.id), ['2035-11-13', '2035-11-20', '2035-11-27'],
-    'abgesagt, per EXDATE ausgenommen und verschoben - alle auf dem UTC-Tag');
+  assert.deepEqual(exceptionDates(row.id), ['2035-11-13', '2035-11-20', '2035-11-27', '2036-11-04'],
+    'abgesagt, per EXDATE ausgenommen und verschoben - auf dem UTC-Tag; die Absage hinter dem Fenster bleibt');
   assert.equal(__test.getSyncToken('family2000'), 'token-nach-2000');
 });
 
