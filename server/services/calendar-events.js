@@ -217,8 +217,23 @@ export function expandRecurringEvents(
     const instantFuer = (tag) => (lokalRechnen
       ? localToUTC(`${tag}T${wall.time}`, event.tzid)
       : (tzAware ? localToUTC(`${tag}T${wall.time}`, event.tzid) : tag + timeSuffix));
-    /** Der UTC-TAG eines Vorkommens - fuer Fenster, EXDATE und Ausgabe. */
-    const utcTagFuer = (tag) => (lokalRechnen ? String(instantFuer(tag)).slice(0, 10) : tag);
+    /** Der UTC-TAG eines Vorkommens - fuer Fenster, EXDATE und Ausgabe.
+     *
+     * AUCH IM TZID-PFAD MIT GLEICHEM TAG AM SERIENSTART (#2000). `tzAware`
+     * fragt nur, ob lokaler und UTC-Tag am ERSTEN Vorkommen uebereinstimmen.
+     * Ein spaeteres kann trotzdem auf einen anderen UTC-Tag fallen: New York
+     * 19:30 ist im Oktober 23:30Z am selben Tag, im November 00:30Z am
+     * Folgetag. Hier stand bis dahin der lokale Tag, die Importe legen EXDATE
+     * aber auf dem UTC-Tag ab - die abgesagte Instanz blieb stehen. Wo das
+     * Vorkommen als Zeitpunkt entsteht, kommt der Tag deshalb aus diesem
+     * Zeitpunkt; nur zonenlose Vorkommen behalten ihren Tag. */
+    const utcTagFuer = (tag) => ((lokalRechnen || tzAware)
+      ? String(instantFuer(tag)).slice(0, 10)
+      : tag);
+    // Der UTC-Tag des ersten Vorkommens, auf derselben Rechnung: ein Start mit
+    // Offset (`T19:30:00-05:00` aus Google) traegt in seinen ersten zehn
+    // Zeichen den lokalen Tag, nicht den UTC-Tag.
+    const seriesStartUtcTag = utcTagFuer(seriesStart);
 
     let currentDate = seriesStart; // YYYY-MM-DD, lokal oder UTC je nach Modus
     let iterations  = 0;
@@ -372,7 +387,7 @@ export function expandRecurringEvents(
           // oben ebenfalls im UTC-Raum nachgeschlagen
           // (`exceptions?.has(utcTagFuer(currentDate))`).
           ...(includeRecurrenceIdentity ? { recurrence_identity: utcTagFuer(currentDate) } : {}),
-          is_recurring_instance: utcTagFuer(currentDate) !== seriesStartUtc ? 1 : 0,
+          is_recurring_instance: utcTagFuer(currentDate) !== seriesStartUtcTag ? 1 : 0,
           // "IST DAS DER ERSTE TERMIN DER SERIE?" IST NICHT "WEICHT ER VOM
           // GESPEICHERTEN DATUM AB?" - seit ein Start auf der Regel liegen darf,
           // ohne ihr Raster zu treffen (#960), sind das zwei Fragen. Ein Termin

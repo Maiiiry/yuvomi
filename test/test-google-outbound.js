@@ -961,6 +961,29 @@ test('ein abgesagtes Vorkommen nimmt sein Datum aus der Serie, ohne sie zu lösc
   assert.deepEqual(exceptionDates(rows[0].id), ['2035-03-17']);
 });
 
+test('#2000: Absage und EXDATE einer Abendserie landen auf dem UTC-Tag des Vorkommens', () => {
+  reset();
+  const calRefId = __test.upsertExternalCalendar('google', 'primary', 'Primär', '#4285F4');
+
+  // New York 19:30: im Winter 00:30Z am Folgetag. Google nennt den Slot mit
+  // dem Offset der Serienzone, dessen erste zehn Zeichen der LOKALE Tag sind.
+  __test.upsertGoogleEvents([
+    seriesMaster('chor', {
+      recurrence: ['RRULE:FREQ=WEEKLY', 'EXDATE;TZID=America/New_York:20351119T193000'],
+      start: { dateTime: '2035-10-01T19:30:00-04:00', timeZone: 'America/New_York' },
+      end:   { dateTime: '2035-10-01T20:30:00-04:00', timeZone: 'America/New_York' },
+    }),
+    occurrence('chor', '20351113T003000Z', {
+      status: 'cancelled',
+      originalStartTime: { dateTime: '2035-11-12T19:30:00-05:00' },
+    }),
+  ], calRefId);
+
+  const master = googleRows().find((r) => r.external_calendar_id === 'chor');
+  assert.deepEqual(exceptionDates(master.id), ['2035-11-13', '2035-11-20'],
+    'der Schluessel, den ICS, CalDAV und Apple ablegen und die Expansion nachschlaegt');
+});
+
 test('die Reihenfolge in Googles Antwort spielt keine Rolle', () => {
   reset();
   const calRefId = __test.upsertExternalCalendar('google', 'primary', 'Primär', '#4285F4');

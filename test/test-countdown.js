@@ -924,3 +924,22 @@ test('ein Countdown auf einem Termin aus fremdem ungeteiltem ICS-Abo bleibt bei 
   get().prepare('DELETE FROM calendar_events').run();
   get().prepare('DELETE FROM ics_subscriptions').run();
 });
+
+test('#2000: eine abgesagte Instanz ist auch ueber die Zeitumstellung kein naechster Termin', () => {
+  // New York 19:30 ab 01.10.2035, im Winter 00:30Z am Folgetag. Die Ausnahme
+  // traegt den UTC-Tag (13.) des Vorkommens vom 12. November - wie im Kalender.
+  const ev = {
+    start_datetime: '2035-10-01T23:30:00Z', all_day: 0,
+    recurrence_rule: 'FREQ=WEEKLY', tzid: 'America/New_York',
+  };
+  const tz = 'America/New_York';
+  assert.equal(nextEventDate(ev, '2035-11-10', new Set(['2035-11-13']), { tz }), '2035-11-19',
+    'der abgesagte 12. November darf nicht der naechste Termin sein');
+  assert.equal(nextEventDate(ev, '2035-11-10', new Set(['2035-11-12']), { tz }), '2035-11-12',
+    'der lokale Tag ist nicht der Schluessel dieses Vorkommens');
+  // Vor der Umstellung: 15. Oktober 19:30 EDT = 23:30Z am selben Tag.
+  assert.equal(nextEventDate(ev, '2035-10-14', new Set(['2035-10-15']), { tz }), '2035-10-22');
+  // Dieselbe Serie aus Google: Start mit dem Offset der Serienzone.
+  const google = { ...ev, start_datetime: '2035-10-01T19:30:00-04:00' };
+  assert.equal(nextEventDate(google, '2035-11-10', new Set(['2035-11-13']), { tz }), '2035-11-19');
+});
