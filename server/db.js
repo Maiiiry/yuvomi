@@ -28,11 +28,10 @@ import { RESTORE_IN_PROGRESS_MESSAGE, RESTORE_IN_PROGRESS_REASON } from './utils
 import { setRestoreRunning, activeWriters, restoreWaitTimeoutMs, waitUntilIdle } from './utils/restore-state.js';
 import { decodeHtmlEntities } from './utils/html-entities.js';
 import { toE164, defaultCountryFromConfig } from './utils/phone.js';
-import {
-  householdTimeZone, isValidTimeZone, localToUTC, storedToInstantIso, todayKey, utcToWall,
-} from './utils/timezone.js';
+import { householdTimeZone, isValidTimeZone, todayKey } from './utils/timezone.js';
 import { addMonthsClamped, liftToAnchorDay } from './utils/interval-date.js';
-import { googleFullSyncTimeMax } from './utils/google-sync-window.js';
+import { occurrenceClock } from './services/calendar-events.js';
+import { nextOccurrenceAfter } from './services/recurrence.js';
 
 const log = createLogger('DB');
 
@@ -10925,91 +10924,57 @@ const MIGRATIONS = [
     // hatten bis dahin den LOKALEN Tag abgelegt: der Google-Abruf und die
     // Ausnahmen und verknuepften Einzeltermine einer hier gefuehrten Serie.
     //
-    // Hier gefuehrt: die Schluessel stammen nur aus der Oberflaeche und waren
-    // sicher lokale Tage - sie werden umgerechnet.
-    //
-    // Google: NICHT umgerechnet, sondern neu abgerufen. Der Abruf legte je nach
-    // Form den lokalen Tag (`originalStartTime` mit Offset, `EXDATE;TZID=`) oder
-    // schon den UTC-Tag (`EXDATE:...Z`) ab, und welche Form es war, steht
-    // nirgends. Eine Umrechnung muesste raten und verschoebe die UTC-Schluessel
-    // um einen Tag (Codex-Review zu #2031). Also fallen die Ausnahmen getimter
-    // Google-Serien weg und die Sync-Tokens mit ihnen: der naechste Lauf ist ein
-    // Full-Resync, und der liefert jede abgesagte und verschobene Instanz einer
-    // Serie wieder (`showDeleted`, Google haelt sie fuer die Lebensdauer der
-    // Serie vor) - aber nur bis zu seinem `timeMax`. Was dahinter liegt, bleibt
-    // stehen (utils/google-sync-window.js). Ausnahmen einer Google-Serie entstehen nur dort - die
-    // Oberflaeche nimmt fuer fremde Serien keine an.
+    // Umgerechnet wird, nichts geloescht und nichts neu abgerufen: ein Abruf
+    // liefert alte Absagen nur bis zu seinem `timeMax` und nicht fuer Master,
+    // deren lokale Aenderung noch auf den Push wartet (Codex-Reviews zu #2031).
+    // Rechnung und Auswahl in rekeyZonedOccurrenceDays().
     //
     // ICS, CalDAV und Apple schrieben schon immer den UTC-Tag; ihre Zeilen
-    // bleiben unberuehrt. Rechnung und Auswahl in rekeyZonedOccurrenceDays().
-    up(database, { now = Date.now() } = {}) {
-      rekeyZonedOccurrenceDays(database, { now });
+    // bleiben unberuehrt.
+    up(database) {
+      rekeyZonedOccurrenceDays(database);
     },
   },
 ];
 
 /**
  * Der Nachtrag zu Migration 250 (#2000): Schluessel, die den lokalen Tag eines
- * Vorkommens nennen, auf dessen UTC-Tag bringen.
+ * Vorkommens nennen, auf dessen UTC-Tag bringen. Die Rechnung ist die der
+ * Expansion (`occurrenceClock` in services/calendar-events.js): der Tag auf
+ * der Schleife ist der Tag in der Serienzone, `utcTagFuer` macht daraus den
+ * Schluessel.
  *
- * Google-Serien (getimt): Ausnahmen loeschen, die der naechste Full-Resync
- * wieder liefert (vor seinem `timeMax`), und die Sync-Tokens verwerfen; der
- * Abruf schreibt sie in der neuen Form (Begruendung an Migration 250).
- * `now` ist der Zeitpunkt, von dem aus das Fenster gerechnet wird.
+ * HIER GEFUEHRTE SERIEN mit `tzid`, deren erstes Vorkommen lokal und in UTC
+ * auf denselben Tag faellt: nur dort lief die alte Expansion auf dem lokalen
+ * Tag, und die Schluessel kamen nur aus der Oberflaeche - jeder ist ein
+ * lokaler Tag und wird umgerechnet, Ausnahmen wie verknuepfte Einzeltermine.
  *
- * Hier gefuehrte Serien mit `tzid`, deren erstes Vorkommen lokal und in UTC
- * auf denselben Tag faellt - nur dort lief die alte Expansion auf dem lokalen
- * Tag: jeder Schluessel wird zum UTC-Tag der Serien-Wanduhr an diesem Tag,
- * dieselbe Rechnung wie `instantFuer()` in services/calendar-events.js.
+ * GOOGLE-SERIEN (getimt, mit `tzid`): der Abruf legte je nach Form den lokalen
+ * Tag (`originalStartTime` mit Offset, `EXDATE;TZID=`) oder schon den UTC-Tag
+ * (`EXDATE:...Z`) ab, und welche Form es war, steht nirgends. Entschieden wird
+ * an der Regel: ein Schluessel K ist lokal gemeint, wenn K ein Vorkommen der
+ * Serie in ihrer Zone ist, dessen UTC-Tag nicht K ist, und KEIN Vorkommen K
+ * als UTC-Tag hat. Dann wird er umgerechnet. Passt er auf beide Lesarten (nur
+ * bei Regeln auf aufeinanderfolgenden Tagen moeglich), bleibt er stehen - er
+ * ist nicht zu entscheiden (#2034). Ein UTC-Schluessel bleibt ohnehin.
+ *
  * Zweiphasig, weil sich die Schluessel einer taeglichen Serie gegenseitig
  * verdraengen (K -> K+1, K+1 -> K+2): erst alle alten weg, dann alle neuen
  * hinein. Die Aufrufer sorgen fuer die Transaktion.
  */
-function rekeyZonedOccurrenceDays(database, { now = Date.now() } = {}) {
+function rekeyZonedOccurrenceDays(database) {
   const hasColumn = (table, column) => database.prepare(`PRAGMA table_info(${table})`).all()
     .some((c) => c.name === column);
   if (!hasColumn('calendar_events', 'tzid')) return;
   const withChildren = hasColumn('calendar_events', 'recurrence_parent_id')
     && hasColumn('calendar_events', 'recurrence_id');
-  // NUR WAS DER FULL-RESYNC WIEDER LIEFERT (Codex-Review zu #2031). Sein
-  // `timeMax` liegt ein Jahr nach dem Abruf, eine Untergrenze hat er nicht.
-  // Eine Absage dahinter kaeme nie zurueck - ein Schluessel, der vielleicht
-  // einen Tag daneben liegt, ist besser als eine verlorene Absage. Zwei Tage
-  // Abstand zur Grenze: einer fuer die Zone des Schluessels, einer fuer den
-  // Weg von der Migration bis zum Abruf.
-  const keepFrom = (() => {
-    const max = new Date(googleFullSyncTimeMax(now));
-    max.setUTCDate(max.getUTCDate() - 2);
-    return max.toISOString().slice(0, 10);
-  })();
-  const googleSeries = database.prepare(`
-    SELECT id FROM calendar_events
-    WHERE external_source = 'google' AND all_day = 0
-      AND recurrence_rule IS NOT NULL AND recurrence_rule <> ''
-      AND id IN (SELECT event_id FROM calendar_event_exceptions WHERE exception_date < ?)
-  `).all(keepFrom);
-  if (googleSeries.length > 0) {
-    const dropCovered = database.prepare(
-      'DELETE FROM calendar_event_exceptions WHERE event_id = ? AND exception_date < ?'
-    );
-    for (const { id } of googleSeries) dropCovered.run(id, keepFrom);
-    const hasSelection = database.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'google_calendar_selection'"
-    ).get();
-    if (hasSelection) {
-      database.prepare(`UPDATE google_calendar_selection
-                           SET sync_token = NULL, last_sync = NULL
-                         WHERE sync_token IS NOT NULL`).run();
-    }
-  }
-
   const householdZone = householdTimeZone(database);
   const series = database.prepare(`
-    SELECT id, start_datetime, tzid
+    SELECT id, start_datetime, end_datetime, all_day, recurrence_rule, tzid, external_source
     FROM calendar_events
     WHERE recurrence_rule IS NOT NULL AND recurrence_rule <> ''
       AND tzid IS NOT NULL AND tzid <> '' AND all_day = 0
-      AND external_source = 'local'
+      AND external_source IN ('google', 'local')
       ${withChildren ? 'AND recurrence_parent_id IS NULL' : ''}
   `).all();
   const exceptionsOf = database.prepare('SELECT exception_date FROM calendar_event_exceptions WHERE event_id = ?');
@@ -11021,38 +10986,51 @@ function rekeyZonedOccurrenceDays(database, { now = Date.now() } = {}) {
   const setChildKey = withChildren
     ? database.prepare('UPDATE calendar_events SET recurrence_id = ? WHERE id = ?')
     : null;
+  const isDay = (key) => /^\d{4}-\d{2}-\d{2}$/.test(String(key));
+  const shiftDay = (key, days) => {
+    const d = new Date(`${key}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+  };
 
   for (const row of series) {
-    let start;
-    try {
-      start = storedToInstantIso(row.start_datetime, householdZone);
-    } catch { continue; }
-    if (!start || !isValidTimeZone(row.tzid)) continue;
-    const wall = utcToWall(start, row.tzid);
-    if (!wall) continue;
-    // Eine Serie mit verschiedenen Tagen am Start lief schon auf dem UTC-Tag;
-    // ihre Schluessel stimmen bereits.
-    if (wall.date !== start.slice(0, 10)) continue;
+    if (!isValidTimeZone(row.tzid)) continue;
+    let clock;
+    try { clock = occurrenceClock(row, householdZone); } catch { continue; }
+    if (!clock.wall) continue;
 
-    const utcDay = (key) => {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(key))) return null;
-      const instant = localToUTC(`${key}T${wall.time}`, row.tzid);
-      const ms = Date.parse(instant);
-      return Number.isFinite(ms) ? new Date(ms).toISOString().slice(0, 10) : null;
-    };
+    let newKeyFor;
+    if (row.external_source === 'local') {
+      // Mit verschiedenen Tagen am Start lief die Serie schon auf dem UTC-Tag.
+      if (!clock.tzAware) continue;
+      newKeyFor = (key) => (isDay(key) ? clock.utcTagFuer(key) : null);
+    } else {
+      const isOccurrence = (tag) => tag >= clock.seriesStart
+        && nextOccurrenceAfter(clock.seriesStart, row.recurrence_rule, tag, { seriesStart: clock.seriesStart }) === tag;
+      newKeyFor = (key) => {
+        if (!isDay(key) || !isOccurrence(key)) return null;
+        const next = clock.utcTagFuer(key);
+        if (next === key) return null;
+        const alsoUtc = [-1, 0, 1].some((offset) => {
+          const tag = shiftDay(key, offset);
+          return isOccurrence(tag) && clock.utcTagFuer(tag) === key;
+        });
+        return alsoUtc ? null : next;
+      };
+    }
 
     const moves = [];
     for (const { exception_date: key } of exceptionsOf.all(row.id)) {
-      const next = utcDay(key);
+      const next = newKeyFor(key);
       if (next && next !== key) moves.push([key, next]);
     }
     for (const [key] of moves) dropException.run(row.id, key);
     for (const [, next] of moves) addException.run(row.id, next);
 
-    if (!withChildren) continue;
+    if (!withChildren || row.external_source !== 'local') continue;
     const childMoves = [];
     for (const child of childrenOf.all(row.id)) {
-      const next = utcDay(child.recurrence_id);
+      const next = newKeyFor(child.recurrence_id);
       if (next && next !== child.recurrence_id) childMoves.push([child.id, next]);
     }
     // Ueber einen Zwischenwert, sonst stoesst K -> K+1 an den eindeutigen

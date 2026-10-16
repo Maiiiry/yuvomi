@@ -4,7 +4,9 @@
  * Abhängigkeiten: server/services/recurrence.js
  */
 
-import { nextOccurrence, parseRRule, matchesRRuleByday, untilInstantMs } from './recurrence.js';
+import {
+  nextOccurrence, nextOccurrenceAfter, parseRRule, matchesRRuleByday, untilInstantMs,
+} from './recurrence.js';
 import {
   hasExplicitZone, householdTimeZone, localToUTC, storedToInstantIso, utcToWall,
 } from '../utils/timezone.js';
@@ -450,9 +452,16 @@ export function expandRecurringEvents(
  * Countdown-Kachel). Gerechnet mit derselben Uhr wie die Expansion
  * (`occurrenceClock`), aber ohne die Serie auszurollen: der Tag des Vorkommens
  * auf der Schleife liegt hoechstens einen Tag neben `dayKey`, also werden die
- * drei Kandidaten gestartet und der genommen, dessen Start in `zone` auf
- * `dayKey` faellt. Konstanter Aufwand, egal wie alt die Serie ist. Ob die
- * Regel an dem Tag ueberhaupt ein Vorkommen hat, fragt der Aufrufer selbst.
+ * drei Kandidaten gestartet und der genommen, der ein Vorkommen der Regel ist
+ * und dessen Start in `zone` auf `dayKey` faellt. Konstanter Aufwand, egal wie
+ * alt die Serie ist: ob ein Tag auf der Regel liegt, beantwortet
+ * `nextOccurrenceAfter` mit seinem Sprung, nicht durch Ausrollen.
+ *
+ * Faellt kein Vorkommen auf `dayKey`, aber `dayKey` selbst ist ein Tag der
+ * Regel in der Serienzone, gilt dessen Schluessel: die Kachel zaehlt ihre
+ * Kandidaten auf der Regel weiter, und wo Haushalts- und Serienzone nach einer
+ * Umstellung auseinanderliegen, ist ihr Kandidat dieser Serientag
+ * (Codex-Review zu #2031).
  *
  * @param {object} event   Serienzeile (start_datetime, all_day, tzid, ...)
  * @param {string} dayKey  YYYY-MM-DD in `zone`
@@ -469,11 +478,14 @@ export function occurrenceKeyOnDay(event, dayKey, zone, { householdZone = null }
     d.setUTCDate(d.getUTCDate() + days);
     return d.toISOString().slice(0, 10);
   };
+  const isOccurrence = (tag) => tag >= clock.seriesStart
+    && nextOccurrenceAfter(clock.seriesStart, event.recurrence_rule, tag, { seriesStart: clock.seriesStart }) === tag;
   for (const offset of [0, -1, 1]) {
     const tag = shift(dayKey, offset);
+    if (!isOccurrence(tag)) continue;
     const start = String(clock.instantFuer(tag));
     const day = hasExplicitZone(start) ? utcToWall(start, zone)?.date : start.slice(0, 10);
     if (day === dayKey) return clock.utcTagFuer(tag);
   }
-  return dayKey;
+  return isOccurrence(dayKey) ? clock.utcTagFuer(dayKey) : dayKey;
 }

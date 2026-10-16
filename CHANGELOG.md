@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancelled one occurrence of a series with its own time zone, the calendar could keep showing it
   once daylight saving time had changed, most often for evening events in the Americas and early
   morning events in Europe. The calendar, search, countdowns and the calendar feed now all agree on
-  which occurrence was cancelled. After the update, Yuvomi fetches Google Calendar series in full
-  once; until that first sync has run, occurrences cancelled in Google may briefly show again.
+  which occurrence was cancelled, and occurrences already cancelled from Google Calendar stay hidden
+  after the update.
 
 - **A task's due time on the calendar follows your time format** (#2018). With a region that uses
   the 12-hour clock, such as American English, tasks in the month, week, day and agenda views

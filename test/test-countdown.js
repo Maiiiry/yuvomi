@@ -979,3 +979,19 @@ test('#2000: der Schluessel eines Vorkommens kostet nicht die ganze Historie der
   assert.equal(nextEventDate(ev, '2035-11-12', new Set(['2035-11-13']), { tz }), '2035-11-13',
     'das abgesagte Vorkommen vom 12. November wird uebersprungen');
 });
+
+test('#2000: woechentlich Berlin, Haushalt in UTC - der Nachbartag muss auf der Regel liegen', () => {
+  // Montags 01:30 Berlin ab 05.03.2035: 00:30Z. Ab dem 25. Maerz ist 01:30
+  // MESZ 23:30Z am Sonntag - das Vorkommen vom Montag, 2. April, beginnt in
+  // UTC am 1. und traegt den Schluessel `2035-04-01`. Der Dienstag daneben ist
+  // kein Vorkommen, auch wenn sein Zeitpunkt auf den Montag faellt
+  // (Codex-Review zu #2031).
+  const ev = {
+    start_datetime: '2035-03-05T00:30:00Z', all_day: 0,
+    recurrence_rule: 'FREQ=WEEKLY', tzid: 'Europe/Berlin',
+  };
+  const tz = 'UTC';
+  assert.equal(nextEventDate(ev, '2035-03-30', new Set(['2035-04-01']), { tz }), '2035-04-09',
+    'das abgesagte Vorkommen vom 2. April darf nicht der naechste Termin sein');
+  assert.equal(nextEventDate(ev, '2035-03-30', null, { tz }), '2035-04-02', 'ohne Absage steht es da');
+});

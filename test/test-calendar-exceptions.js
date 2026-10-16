@@ -282,7 +282,7 @@ test('#2000: GET /calendar zeigt das abgesagte Vorkommen nicht', async () => {
   } finally { await close(); }
 });
 
-test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abgerufen, CalDAV unberuehrt', () => {
+test('#2000: Migration 250 rechnet per Regel um und loescht nichts', () => {
   seedUser();
   setHouseholdZone('America/New_York');
   const migration = MIGRATIONS.find((m) => m.version === 250);
@@ -293,20 +293,27 @@ test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abger
   db.get().prepare(`INSERT INTO google_calendar_selection (calendar_id, name, enabled, sync_token, last_sync)
     VALUES ('g2000', 'G', 1, 'tok-2000', '2035-11-01T00:00:00Z')
     ON CONFLICT(calendar_id) DO UPDATE SET sync_token = excluded.sync_token, last_sync = excluded.last_sync`).run();
+  const googleSeries = (rule, { dirty = 0 } = {}) => db.get().prepare(
+    `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, tzid,
+       external_source, external_calendar_id, outbound_dirty, created_by)
+     VALUES ('G', '2035-10-01T19:30:00-04:00', '2035-10-01T20:30:00-04:00', 0, ?, 'America/New_York',
+       'google', ?, ?, 1)`
+  ).run(rule, `g-${rule}-${dirty}`, dirty).lastInsertRowid;
 
-  // Google: welche Form ein Schluessel hatte, steht nirgends. `2035-11-12`
-  // kam aus `originalStartTime` mit Offset (lokal), `2035-11-13` aus
-  // `EXDATE:20351113T003000Z` (schon UTC). Eine Umrechnung muesste raten und
-  // verschoebe den zweiten auf den 14. (Codex-Review zu #2031).
-  const google = db.get().prepare(
-    `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, tzid, external_source, external_calendar_id, created_by)
-     VALUES ('G', '2035-10-01T19:30:00-04:00', '2035-10-01T20:30:00-04:00', 0, 'FREQ=WEEKLY', 'America/New_York', 'google', 'g1', 1)`
-  ).run().lastInsertRowid;
-  addException(google, '2035-11-12');
-  addException(google, '2035-11-13');
-  // Hinter dem Fenster des Full-Resyncs (`timeMax` = Abruf + 365 Tage): der
-  // Abruf liefert diese Absage nicht wieder, also bleibt ihr Schluessel.
-  addException(google, '2036-11-05'); // 400 Tage nach dem 01.10.2035
+  // Google, woechentlich montags 19:30 New York.
+  const weekly = googleSeries('RRULE:FREQ=WEEKLY');
+  addException(weekly, '2035-10-15'); // EDT, lokal = UTC: bleibt
+  addException(weekly, '2035-11-19'); // lokal (Montag, originalStartTime mit Offset) -> 20.
+  addException(weekly, '2035-11-13'); // schon UTC (EXDATE:20351113T003000Z, Dienstag): bleibt
+  addException(weekly, '2036-11-03'); // mehr als ein Jahr spaeter, lokal -> 04.
+  // Ein Master, dessen lokale Aenderung noch auf den Push wartet: umgerechnet
+  // wie jeder andere, nichts geht verloren.
+  const dirty = googleSeries('RRULE:FREQ=WEEKLY', { dirty: 1 });
+  addException(dirty, '2035-11-12');
+  // Taeglich: `2035-11-12` ist der lokale Tag des Vorkommens vom 12. UND der
+  // UTC-Tag des Vorkommens vom 11. - nicht zu entscheiden, bleibt (#2034).
+  const daily = googleSeries('RRULE:FREQ=DAILY');
+  addException(daily, '2035-11-12');
   // Eine ganztaegige Google-Serie hat nur Tage als Schluessel - sie bleibt.
   const googleAllDay = db.get().prepare(
     `INSERT INTO calendar_events (title, start_datetime, end_datetime, all_day, recurrence_rule, external_source, external_calendar_id, created_by)
@@ -336,24 +343,25 @@ test('#2000: Migration 250 - hier gefuehrte Serien umgerechnet, Google neu abger
   const caldav = seedNewYorkEvening();
   addException(caldav, '2035-11-13');
 
-  // Die Migration laeuft am 01.10.2035 - feste Uhr statt der echten.
-  migration.up(db.get(), { now: Date.UTC(2035, 9, 1, 12) });
+  migration.up(db.get());
 
-  assert.deepEqual(exceptions(google), ['2036-11-05'],
-    'Google: geratene Schluessel im Fenster weg, die Absage dahinter bleibt');
-  assert.deepEqual(
-    db.get().prepare("SELECT sync_token, last_sync FROM google_calendar_selection WHERE calendar_id = 'g2000'").get(),
-    { sync_token: null, last_sync: null },
-    'Google: der naechste Lauf ist ein Full-Resync, der die Ausnahmen neu schreibt',
-  );
+  assert.deepEqual(exceptions(weekly), ['2035-10-15', '2035-11-13', '2035-11-20', '2036-11-04']);
+  assert.deepEqual(exceptions(dirty), ['2035-11-13']);
+  assert.deepEqual(exceptions(daily), ['2035-11-12'], 'mehrdeutig: bleibt stehen');
   assert.deepEqual(exceptions(googleAllDay), ['2035-11-12']);
+  assert.equal(
+    db.get().prepare("SELECT sync_token FROM google_calendar_selection WHERE calendar_id = 'g2000'").get().sync_token,
+    'tok-2000', 'kein erzwungener Neuabruf');
   assert.deepEqual(exceptions(local), ['2035-10-15', '2035-11-13', '2035-11-14']);
   const childKey = (id) => db.get().prepare('SELECT recurrence_id FROM calendar_events WHERE id = ?').get(id).recurrence_id;
   assert.equal(childKey(child), '2035-11-20');
   assert.equal(childKey(nextChild), '2035-11-21');
   assert.deepEqual(exceptions(caldav), ['2035-11-13']);
 
-  // Und die Expansion trifft danach das gemeinte Vorkommen.
+  // Und die Expansion trifft danach die gemeinten Vorkommen.
+  const weeklyStarts = startsOf(weekly, '2035-11-10', '2035-11-25');
+  assert.ok(!weeklyStarts.includes('2035-11-13T00:30:00Z'), 'Google: der 12. November bleibt abgesagt (UTC-Schluessel)');
+  assert.ok(!weeklyStarts.includes('2035-11-20T00:30:00Z'), 'Google: der 19. November bleibt abgesagt (umgerechnet)');
   const localStarts = startsOf(local, '2035-11-10', '2035-11-16');
   assert.ok(!localStarts.includes('2035-11-13T00:30:00Z'), 'der 12. November bleibt abgesagt');
   assert.ok(!localStarts.includes('2035-11-14T00:30:00Z'), 'der 13. November bleibt abgesagt');
